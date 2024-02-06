@@ -1,0 +1,1394 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EC2 Image Builder Pipeline for EKS Optimized Image with Ansible playbook
+Parameters:
+  AnsiblePlaybookArguments:
+    Type: String
+    Description: Enter extra arguments you want to pass to 'ansible-playbook' command. (Advanced)
+    Default: '--skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17'
+  LatestEKSOptimizedAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/eks/optimized-ami/1.27/amazon-linux-2/recommended/image_id
+    Description: AWS Systems Manager Parameter Store parameter of the AMI ID for the worker node instances. Change this value to match the version of Kubernetes you are using.
+  InstanceType:
+    Description: Insance type used with EC2 Image Builder Infrastructure Configuration
+    Type: String
+    Default: t2.small
+  ComponentName:
+    Description: EC2 Image Builder Component Name
+    Type: String
+    Default: EKS-Ansible-Component
+  RecipeName:
+    Description: EC2 Image Builder Recipe Name
+    Type: String
+    Default: EKS-Ansible-Recipe
+  InfrastructureConfigurationName:
+    Description: EC2 Image Builder Infrastructure Configuration Name
+    Type: String
+    Default: EKS-ImageBuilder-Infrastructure-Config
+  DistributionConfigurationName:
+    Description: EC2 Image Builder Distribution Configuration Name
+    Type: String
+    Default: EKS-ImageBuilder-Distribution-Configuration
+  ImagePipelineName:
+    Description: EC2 Image Builder Image Pipeline Name
+    Type: String
+    Default: EKS-AMI-hardening-Pipeline
+  EnableImageScanning:
+    Description: Enter true to enable Amazon Inspector scanning for your AMIs. Enter false to disable AMI scanning.
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+  ClusterTags:
+    Description: A JSON string containing the tags as a list of key-value pairs to filter EKS clusters
+    Type: String
+    Default: '[]'
+  CloudFormationUpdaterEventBridgeRuleState:
+    Description: EventBridge rule state. Rule runs every weekend and if there is a new base image, sends results to an SNS topic.
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - DISABLED
+      - ENABLED
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Ansible Configuration
+        Parameters:
+          - AnsiblePlaybookArguments
+      - Label:
+          default: AMI Configurations
+        Parameters:
+          - LatestEKSOptimizedAMI
+          - InstanceType
+      - Label:
+          default: EC2 Image Builder Configurations
+        Parameters:
+          - ComponentName
+          - RecipeName
+          - InfrastructureConfigurationName
+          - DistributionConfigurationName
+          - ImagePipelineName
+          - EnableImageScanning
+      - Label:
+          default: Target Cluster Tags
+        Parameters:
+          - ClusterTags
+      - Label:
+          default: Automation parameters
+        Parameters:
+          - CloudFormationUpdaterEventBridgeRuleState
+Resources:
+  # S3 Bucket to store benchmark audit results
+  ImagePipelineS3:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        LogFilePrefix: access-logs
+      VersioningConfiguration:
+        Status: Enabled
+  # S3 bucket policy for Image Pipeline S3 bucket
+  ImagePipelineS3Policy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImagePipelineS3
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - !Sub ${ImagePipelineS3.Arn}/*
+              - !Sub ${ImagePipelineS3.Arn}
+            Principal:
+              AWS: !Ref AWS::AccountId
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub ${ImagePipelineS3.Arn}/*
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt ImagePipelineS3.Arn
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+          - Action:
+              - s3:PutObject
+            Effect: Deny
+            Resource: !Sub ${ImagePipelineS3.Arn}/*
+            Principal: '*'
+            Condition:
+              ArnNotEquals:
+                aws:PrincipalArn: !GetAtt ImageBuilderRole.Arn
+  # SNS topic Key for Image Pipeline SNS topic
+  SNStopicKey:
+    Type: AWS::KMS::Key
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      Description: KMS Key to encrypt SNS topics for EKS node group update topics
+      EnableKeyRotation: true
+      PendingWindowInDays: 20
+      KeyPolicy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Enable EventBridge, image update reminder lambda, and ImageBuilder Permissions
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+              AWS:
+                - !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/imagebuilder.amazonaws.com/AWSServiceRoleForImageBuilder
+                - !GetAtt ImageUpdateReminderLambdaExecutionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+  # Image Pipeline SNS topic
+  ImagePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub ${ImagePipelineName} Topic
+      KmsMasterKeyId: !Ref SNStopicKey
+  # IAM role for EC2 Image Builder pipeline
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+            Action:
+              - sts:AssumeRole
+      Path: /ec2/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+  # IAM Policy for Image Builder Pipeline to access audit S3 bucket
+  ImageBuilderS3AccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Managed policy for Image builder to access S3 buckets
+      Roles:
+        - !Ref ImageBuilderRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - !Sub ${ImagePipelineS3.Arn}/*
+  # Instance profile for Image Builder EC2 instance
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ImageBuilderRole
+  # EC2 Image Builder component
+  EKSAnsibleComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Ref ComponentName
+      Version: 1.0.0
+      Description: Ansible component for EC2 Image Builder
+      Platform: Linux
+      Data: !Sub |
+        name: ExecuteAnsiblePlaybook
+        description: Execute an Ansible playbook
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: installRequirements
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo yum install -y git jq
+                    - sudo mkdir -p /ansible/roles/AMAZON2-CIS
+                    - git clone https://github.com/ansible-lockdown/AMAZON2-CIS.git /ansible/roles/AMAZON2-CIS
+                    - |
+                      cat > /ansible/eks-cis.yml <<EOL
+                      - name: CIS AL2 Benchmark
+                        hosts: 127.0.0.1
+                        connection: local
+                        roles:
+                          - AMAZON2-CIS
+                      EOL
+              - name: installAnsible
+                action: ExecuteBash
+                inputs:
+                  commands:
+                  - |
+                    if [ ! -f /etc/os-release ]; then
+                      echo "The file /etc/os-release does not exist on this system."
+                      exit 1
+                    fi
+                    . /etc/os-release
+                    if [ "$ID" = "amzn" ]; then
+                      if [ "$VERSION_ID" = "2" ]; then
+                        echo "Installing Ansible on Amazon Linux 2..."
+                        sudo amazon-linux-extras install ansible2 -y
+                      elif [ "$VERSION_ID" = "2023" ]; then
+                        echo "Installing Ansible on Amazon Linux 2023..."
+                        sudo yum install ansible -y
+                      else
+                        echo "Unknown Amazon Linux version: $VERSION_ID"
+                        exit 1
+                      fi
+                    else
+                      echo "This system is not Amazon Linux."
+                      exit 1
+                    fi
+              - name: InvokeAnsible
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-playbook /ansible/eks-cis.yml ${AnsiblePlaybookArguments}
+              - name: DeletePlaybook
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo rm -rf '/ansible'
+              - name: restartCloud-init
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo cloud-init clean
+          - name: test
+            steps:
+              - name: installRequirements
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - curl -fsSL https://goss.rocks/install | sh
+                    - sudo mkdir -p /var/tmp/AMAZON2-CIS-Audit
+                    - git clone https://github.com/ansible-lockdown/AMAZON2-CIS-Audit.git /var/tmp/AMAZON2-CIS-Audit
+              - name: runGoss
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - cd /var/tmp/AMAZON2-CIS-Audit
+                    - mkdir logs
+                    - sudo su
+                    - ./run_audit.sh -o logs/$(date -d "today" +"%Y%m%d%H%M").json
+              - name: UploadResultsToS3
+                action: S3Upload
+                onFailure: Abort
+                maxAttempts: 3
+                inputs:
+                  - source: /var/tmp/AMAZON2-CIS-Audit/logs/*
+                    destination: s3://${ImagePipelineS3}/cis_audit/
+                    expectedBucketOwner: ${AWS::AccountId}
+              - name: DeleteGoss
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo yum uninstall -y git jq
+                    - sudo rm -rf /var/tmp/AMAZON2-CIS-Audit
+              - name: restartCloud-init
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo cloud-init clean
+  # EC2 Image Builder recipe
+  EKSAnsibleRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Ref RecipeName
+      Version: 1.0.0
+      Description: Image recipe for EKS Optimized Image with Ansible playbook
+      Components:
+        - ComponentArn: !Ref EKSAnsibleComponent
+      ParentImage: !Ref LatestEKSOptimizedAMI
+  # EC2 Image Builder infrastructure configuration
+  ImageBuilderInfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Ref InfrastructureConfigurationName
+      Description: Infrastructure Configuration for EC2 Image Builder
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      SnsTopicArn: !Ref ImagePipelineSNSTopic
+  # EC2 Image Builder distribution configuration
+  ImageBuilderDistributionConfig:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Ref DistributionConfigurationName
+      Description: Distribution Configuration for EC2 Image Builder
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub ${AWS::StackName}-AMI - {{ imagebuilder:buildDate }}
+            Description: CIS Docker Benchmark hardened EKS optimized image
+  # EC2 Image Builder pipeline
+  EKSAnsiblePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Ref ImagePipelineName
+      Description: EC2 Image Builder Pipeline for EKS Optimized Image with Ansible playbook
+      ImageRecipeArn: !Ref EKSAnsibleRecipe
+      InfrastructureConfigurationArn: !Ref ImageBuilderInfrastructureConfig
+      DistributionConfigurationArn: !Ref ImageBuilderDistributionConfig
+      EnhancedImageMetadataEnabled: false
+      ImageScanningConfiguration:
+        ImageScanningEnabled: !Ref EnableImageScanning
+  # EC2 Image Builder SNS topic subscripton (subscribing state machine Lambda)
+  ImageBuilderTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt StepFunctionInvokeLambda.Arn
+      Protocol: lambda
+      TopicArn: !Ref ImagePipelineSNSTopic
+  # Lambda function to invoke state machine
+  StepFunctionInvokeLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: This Lambda does not require access to any resources in private subnets
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt StepFunctionInvokeLambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          def lambda_handler(event, context):
+              """
+              Gets Image Builder pipeline status and invokes Step Function upon successful release of new AMI.
+              """
+              # Extract the image ID from the SNS message
+              sns_message = json.loads(event["Records"][0]["Sns"]["Message"])
+              image_id = sns_message["outputResources"]["amis"][0]["image"]
+              image_status = sns_message["state"]["status"]
+              image_status_reason = sns_message["state"].get("reason")
+              # prepare cluster filter tags
+              tags_json = os.environ['TAGS']
+              tags = json.loads(tags_json)
+              if image_status == "AVAILABLE":
+                  # Start the Step Function
+                  step_function_arn = os.environ['SFARN']
+                  step_function_input = {"image_id": image_id, "tags": tags}
+                  client = boto3.client("stepfunctions")
+                  response = client.start_execution(
+                      stateMachineArn=step_function_arn, input=json.dumps(step_function_input)
+                  )
+                  # Return the Step Function execution ARN
+                  return response["executionArn"]
+              return image_status_reason
+      Environment:
+        Variables:
+          TAGS: !Ref ClusterTags
+          SFARN: !Ref StateMachine
+      ReservedConcurrentExecutions: 1
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:60
+      Timeout: 900
+  # Execution role for state machine invoke Lambda
+  StepFunctionInvokeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /lambda/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  # IAM policy for state machine invoke Lambda
+  StepFunctionInvokeLambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for the State Machine Lambda function execution role
+      Path: /lambda/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: lambda2Statemachine
+            Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref StateMachine
+          - Sid: lambda2cloudwatch
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+              - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:log-stream:*
+      Roles:
+        - !Ref StepFunctionInvokeLambdaExecutionRole
+  # Lambda permission for state machine invoke Lambda
+  StepFunctionInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref StepFunctionInvokeLambda
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Ref ImagePipelineSNSTopic
+  # Lambda function to check for new parent AMI
+  ImageUpdateReminderLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: This Lambda does not require access to any resources in private subnets
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt ImageUpdateReminderLambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import traceback
+          import os
+          import json
+          from datetime import datetime
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools.utilities.typing import LambdaContext
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import BotoCoreError, ClientError
+          # Configure logging
+          logger = Logger(service="Image update reminder", level="INFO")
+          # Configure Boto3 retry mode with max_attempts
+          boto3_config = Config(retries={"mode": "standard", "max_attempts": 10})
+          def handle_errors(func):
+              """
+              A decorator to handle exceptions that might be raised by the wrapped function.
+              """
+              @logger.inject_lambda_context
+              def wrapper(*args, **kwargs):
+                  try:
+                      return func(*args, **kwargs)
+                  except ClientError as e:
+                      error_code = e.response["Error"]["Code"]
+                      error_message = e.response["Error"]["Message"]
+                      logger.error(
+                          "ClientError occurred in function %s: %s - %s",
+                          traceback.extract_stack()[-2].name,
+                          error_code,
+                          error_message,
+                      )
+                      return {
+                          "status": "error",
+                          "error_code": error_code,
+                          "message": error_message,
+                      }
+                  except BotoCoreError:
+                      logger.error(
+                          "BotoCoreError occurred in function %s.",
+                          traceback.extract_stack()[-2].name,
+                      )
+                      return {"status": "error", "message": "An AWS SDK error occurred."}
+                  except Exception as e:
+                      logger.error(
+                          "Unexpected error occurred in function %s: %s",
+                          traceback.extract_stack()[-2].name,
+                          str(e),
+                      )
+                      return {
+                          "status": "error",
+                          "message": f"An unexpected error occurred: {str(e)}",
+                      }
+              return wrapper
+          def get_latest_image(region, image_pipeline_arn):
+              """
+              Returns the latest available image from Image Builder.
+              """
+              imagebuilder = boto3.client("imagebuilder", region_name=region)
+              response = imagebuilder.list_image_pipeline_images(
+                  maxResults=15, imagePipelineArn=image_pipeline_arn
+              )
+              pipeline_response = imagebuilder.get_image_pipeline(
+                  imagePipelineArn=image_pipeline_arn
+              )
+              image_recipe_arn = pipeline_response.get("imagePipeline").get("imageRecipeArn")
+              recipe_response = imagebuilder.get_image_recipe(imageRecipeArn=image_recipe_arn)
+              image_summary_list = response["imageSummaryList"]
+              if not image_summary_list:
+                  return "No available images found"
+              available_images = [
+                  image for image in image_summary_list if image["state"]["status"] == "AVAILABLE"
+              ]
+              latest_image = max(available_images, key=lambda x: x["version"])
+              current_pipeline_parent_ami = recipe_response.get("imageRecipe").get("parentImage")
+              return latest_image, current_pipeline_parent_ami
+          def get_image_parameter_info(ssm_parameter_name, region):
+              """
+              Returns latest modified date of SSM parameter containing parent image information
+              """
+              ssm = boto3.client("ssm", region_name=region)
+              response = ssm.get_parameters(Names=[ssm_parameter_name])
+              if not response["Parameters"]:
+                  raise Exception(f"SSM parameter {ssm_parameter_name} not found")
+              parameter_info = response["Parameters"][0]
+              return parameter_info
+          def get_parent_image_info(region, stack_name):
+              """
+              Returns the current StackVersion from the CloudFormation stack output.
+              """
+              cloudformation = boto3.client("cloudformation", region_name=region)
+              stacks = []
+              next_token = None
+              while True:
+                  if next_token:
+                      response = cloudformation.describe_stacks(
+                          StackName=stack_name, NextToken=next_token
+                      )
+                  else:
+                      response = cloudformation.describe_stacks(StackName=stack_name)
+                  stacks.extend(response["Stacks"])
+                  next_token = response.get("NextToken")
+                  if not next_token:
+                      break
+              stack_parameters = response["Stacks"][0]["Parameters"]
+              latest_eks_optimized_ami = None
+              for parameter in stack_parameters:
+                  if parameter["ParameterKey"] == "LatestEKSOptimizedAMI":
+                      latest_eks_optimized_ami = parameter["ParameterValue"]
+              return latest_eks_optimized_ami
+          def publish_sns_message(message, topic_arn):
+              """
+              Publishes a SNS message containing information regarding EC2 Image Builder parent image.
+              """
+              # Get boto3 client
+              sns = boto3.client("sns")
+              response = sns.publish(TopicArn=topic_arn, Message=json.dumps(message, indent=2))
+              return response
+          @handle_errors
+          def lambda_handler(event, context):
+              """
+              Lambda function entry point.
+              """
+              # Get environment variables
+              region = os.environ.get("REGION", "")
+              stack_name = os.environ.get("STACK_NAME", "")
+              image_pipeline_arn = os.environ.get("IMAGE_PIPELINE_ARN", "")
+              sns_topic_arn = os.environ.get("SNS_Topic_ARN", "")
+              # Get the latest image from Image Builder
+              latest_image, parent_image_id = get_latest_image(region, image_pipeline_arn)
+              image_creation_date = datetime.strptime(
+                  latest_image["dateCreated"], "%Y-%m-%dT%H:%M:%S.%f%z"
+              )
+              # Get the last modified date of the SSM parameter
+              ssm_parameter_name = get_parent_image_info(region, stack_name)
+              parameter_info = get_image_parameter_info(ssm_parameter_name, region)
+              ssm_last_modified_date = parameter_info["LastModifiedDate"]
+              # Compare dates and update stack
+              if ssm_last_modified_date > image_creation_date:
+                  message = {
+                      "Message": "A new version of the parent image for your piprline is available",
+                      "Parent image SSM Parameter path": parameter_info["Name"],
+                      "New parent image AMI ID": parameter_info["Value"],
+                      "Parent image last modified date": ssm_last_modified_date.strftime(
+                          "%Y-%m-%dT%H:%M:%S.%f%z"
+                      ),
+                      "Current parent image AMI ID": parent_image_id,
+                      "Image Pipeline last image build date": image_creation_date.strftime(
+                          "%Y-%m-%dT%H:%M:%S.%f%z"
+                      ),
+                      "Image Pipeline ARN": image_pipeline_arn,
+                  }
+                  response = publish_sns_message(message, sns_topic_arn)
+              else:
+                  message = {
+                      "Message": "Parent image is up to date",
+                      "Parent image SSM Parameter path": parameter_info["Name"],
+                      "New parent image AMI ID": parameter_info["Value"],
+                      "Parent image last modified date": ssm_last_modified_date.strftime(
+                          "%Y-%m-%dT%H:%M:%S.%f%z"
+                      ),
+                      "Current parent image AMI ID": parent_image_id,
+                      "Image Pipeline last image build date": image_creation_date.strftime(
+                          "%Y-%m-%dT%H:%M:%S.%f%z"
+                      ),
+                      "Image Pipeline ARN": image_pipeline_arn,
+                  }
+                  response = publish_sns_message(message, sns_topic_arn)
+              # Return response
+              return response
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          STACK_NAME: !Ref AWS::StackName
+          IMAGE_PIPELINE_ARN: !Ref EKSAnsiblePipeline
+          SNS_Topic_ARN: !Ref ImageUpdateReminderTopic
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:60
+      ReservedConcurrentExecutions: 1
+      Timeout: 900
+  # Execution role for Lambda function that checks for new parent AMI
+  ImageUpdateReminderLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /lambda/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  # IAM policy for Lambda function that checks for new parent AMI
+  ImageUpdateReminderLambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for the State Machine Lambda function execution role
+      Path: /lambda/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: lambda2imagebuilder
+            Effect: Allow
+            Action:
+              - imagebuilder:ListImagePipelineImages
+              - imagebuilder:GetImagePipeline
+              - imagebuilder:GetImageRecipe
+            Resource:
+              - !Ref EKSAnsiblePipeline
+              - !Sub arn:aws:imagebuilder:${AWS::Region}:${AWS::AccountId}:image/*
+              - !Join
+                - ''
+                - - !Sub arn:aws:imagebuilder:${AWS::Region}:${AWS::AccountId}:image-recipe/
+                  - !Select
+                    - 1
+                    - !Split
+                      - /
+                      - !Ref EKSAnsibleRecipe
+                  - /*
+          - Sid: lambda2cloudformation
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+            Resource:
+              - !Ref AWS::StackId
+          - Sid: lambda2ssm
+            Effect: Allow
+            Action:
+              - ssm:GetParameters
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}::parameter/aws/service/ecs/optimized-ami/*
+          - Sid: lambda2sns
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource:
+              - !Ref ImageUpdateReminderTopic
+      Roles:
+        - !Ref ImageUpdateReminderLambdaExecutionRole
+  # Lambda permission for Lambda function that checks for new parent AMI
+  ImageUpdateReminderLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageUpdateReminderLambda
+      Principal: events.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ImageUpdateReminderEventBridgeRule.Arn
+  # IAM role for EventBridge rule
+  EventBridgeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /events/
+  # IAM policy for EventBridge rule's role
+  EventBridgeLambdaPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for EventBridge Lambda role
+      Path: /events/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt ImageUpdateReminderLambda.Arn
+      Roles:
+        - !Ref EventBridgeLambdaRole
+  # EventBridge rule to check for new AMI ID
+  ImageUpdateReminderEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule that invokes CloudFormation Lambda updater pipeline every week
+      ScheduleExpression: cron(0 0 ? * SUN *)
+      Targets:
+        - Arn: !GetAtt ImageUpdateReminderLambda.Arn
+          Id: ImageUpdateReminderLambdaTarget
+      RoleArn: !GetAtt EventBridgeLambdaRole.Arn
+      State: !Ref CloudFormationUpdaterEventBridgeRuleState
+  # SNS topic to publish new AMI ID
+  ImageUpdateReminderTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: ImageUpdateReminderTopic
+      KmsMasterKeyId: !Ref SNStopicKey
+  # Policy for SNS topic that publishes new AMI ID
+  ImageUpdateReminderSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action:
+              - SNS:GetTopicAttributes
+              - SNS:SetTopicAttributes
+              - SNS:AddPermission
+              - SNS:RemovePermission
+              - SNS:DeleteTopic
+              - SNS:Subscribe
+              - SNS:ListSubscriptionsByTopic
+              - SNS:Publish
+            Resource: !Ref ImageUpdateReminderTopic
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Ref AWS::AccountId
+          - Sid: lambda_rule_access
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref ImageUpdateReminderTopic
+      Topics:
+        - !Ref ImageUpdateReminderTopic
+  # Execution role for Lambda function that gathers node group information and updates launch templates
+  NGLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /lambda/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  # IAM policy for NodeGroupInfoLambda Lambda function
+  NGLambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: Actions in policy require Resource="*", view https://docs.aws.amazon.com/service-authorization/latest/reference/reference_policies_actions-resources-contextkeys.html
+    Properties:
+      Description: Policy for the node group finder Lambda function execution role
+      Path: /lambda/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - eks:DescribeNodegroup
+              - eks:ListNodegroups
+              - eks:DescribeCluster
+              - ec2:CreateLaunchTemplateVersion
+            Resource:
+              - !Sub arn:${AWS::Partition}:eks:*:${AWS::AccountId}:nodegroup/*/*/*
+              - !Sub arn:${AWS::Partition}:eks:*:${AWS::AccountId}:cluster/*
+              - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*
+          - Effect: Allow
+            Action:
+              - ec2:DescribeLaunchTemplates
+              - eks:ListClusters
+            Resource: '*'
+      Roles:
+        - !Ref NGLambdaExecutionRole
+  # Lambda function that gathers node group information and updates launch templates
+  NodeGroupInfoLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: This Lambda does not require access to any resources in private subnets
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt NGLambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import traceback
+          import base64
+          import textwrap
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools.utilities.typing import LambdaContext
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import BotoCoreError, ClientError
+          # Configure logging
+          logger = Logger(service="Launch template updater", level="INFO")
+          # Configure Boto3 retry mode with max_attempts
+          boto3_config = Config(retries={"mode": "standard", "max_attempts": 10})
+          def handle_errors(func):
+              """
+              A decorator to handle exceptions that might be raised by the wrapped function.
+              """
+              @logger.inject_lambda_context
+              def wrapper(*args, **kwargs):
+                  try:
+                      return func(*args, **kwargs)
+                  except ClientError as e:
+                      error_code = e.response["Error"]["Code"]
+                      error_message = e.response["Error"]["Message"]
+                      logger.error(
+                          "ClientError occurred in function %s: %s - %s",
+                          traceback.extract_stack()[-2].name,
+                          error_code,
+                          error_message,
+                      )
+                      return {
+                          "status": "error",
+                          "error_code": error_code,
+                          "message": error_message,
+                      }
+                  except BotoCoreError:
+                      logger.error(
+                          "BotoCoreError occurred in function %s.",
+                          traceback.extract_stack()[-2].name,
+                      )
+                      return {"status": "error", "message": "An AWS SDK error occurred."}
+                  except Exception as e:
+                      logger.error(
+                          "Unexpected error occurred in function %s: %s",
+                          traceback.extract_stack()[-2].name,
+                          str(e),
+                      )
+                      return {
+                          "status": "error",
+                          "message": f"An unexpected error occurred: {str(e)}",
+                      }
+              return wrapper
+          def list_clusters(eks_client):
+              """
+              Lists all EKS clusters.
+              Args:
+                  eks_client: An initialized Boto3 EKS client.
+              Returns:
+                  A list of cluster ARNs.
+              """
+              paginator = eks_client.get_paginator("list_clusters")
+              clusters = []
+              for page in paginator.paginate():
+                  clusters.extend(page["clusters"])
+              return clusters
+          def filter_clusters(eks_client, clusters, required_tags):
+              """
+              Retrieves node groups for clusters with the required tags.
+              Args:
+                  ecs: An initialized Boto3 EKS client.
+                  clusters: A list of EKS cluster names.
+                  required_tags: A list of tags to filter clusters. If empty, returns node groups for all clusters.
+              Returns:
+                  A list of node groups.
+              """
+              required_tags_set = (
+                  {(tag["Key"], tag["Value"]) for tag in required_tags} if required_tags else None
+              )
+              def has_required_tags(cluster_tags):
+                  if not required_tags_set:
+                      return True
+                  cluster_tags_set = {(tag["key"], tag["value"]) for tag in cluster_tags}
+                  return required_tags_set.issubset(cluster_tags_set)
+              filtered_clusters = []
+              for cluster in clusters:
+                  cluster_summary = {}
+                  cluster_info = eks_client.describe_cluster(name=cluster)
+                  cluster = cluster_info["cluster"]
+                  cluster_tags = cluster["tags"]
+                  raw_dns = cluster["kubernetesNetworkConfig"].get("serviceIpv4Cidr", False)
+                  if has_required_tags(cluster_tags) and raw_dns:
+                      cluster_summary = {
+                          "name": cluster["name"],
+                          "cluster-ca": cluster["certificateAuthority"].get("data"),
+                          "endpoint": cluster["endpoint"],
+                          "dns": ".".join(raw_dns.split("/")[0].split(".")[:-1] + ["10"]),
+                      }
+                      filtered_clusters.append(cluster_summary)
+              return filtered_clusters
+          def get_node_groups(eks_client, filtered_clusters):
+              """
+              Gets the node groups associated with the cluster.
+              Args:
+                  eks_client: An initialized Boto3 EKS client.
+                  filtered_clusters: A list of EKS Cluster names.
+              Returns:
+                  A list of dictionaries containing node group information.
+              """
+              node_groups = []
+              for cluster in filtered_clusters:
+                  paginator = eks_client.get_paginator("list_nodegroups")
+                  node_groups_list = []
+                  for page in paginator.paginate(clusterName=cluster["name"]):
+                      node_groups_list.extend(page["nodegroups"])
+                  for group in node_groups_list:
+                      group_info = eks_client.describe_nodegroup(
+                          clusterName=cluster["name"], nodegroupName=group
+                      )
+                      if (
+                          "launchTemplate" in group_info["nodegroup"]
+                          and group_info["nodegroup"].get("releaseVersion").startswith("ami")
+                          and group_info["nodegroup"].get("status") == "ACTIVE"
+                      ):
+                          node_group = {
+                              "launchTemplate": group_info["nodegroup"].get("launchTemplate"),
+                              "nodegroupName": group_info["nodegroup"].get("nodegroupName"),
+                              "nodegroupArn": group_info["nodegroup"].get("nodegroupArn"),
+                              "clusterName": group_info["nodegroup"].get("clusterName"),
+                              "cluster-ca": cluster["cluster-ca"],
+                              "endpoint": cluster["endpoint"],
+                              "dns": cluster["dns"],
+                          }
+                          node_groups.append(node_group)
+              return node_groups
+          def update_launch_templates(node_groups, image_id):
+              """
+              Updates the launch templates of the node groups with the provided image ID.
+              Args:
+                  eks_client: An initialized Boto3 EKS client.
+                  node_groups: A list of dictionaries containing node groups' information.
+                  image_id: The image ID to be used in the updated launch templates.
+              Returns:
+                  A list of dictionaries containing the updated node group information.
+              """
+              ec2_client = boto3.client("ec2")
+              processed_launch_templates = set()
+              for node_group in node_groups:
+                  launch_template = node_group["launchTemplate"]
+                  launch_template_id = launch_template["id"]
+                  launch_template_version = launch_template["version"]
+                  user_data = textwrap.dedent(
+                      f"""
+                  MIME-Version: 1.0
+                  Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+                  --==MYBOUNDARY==
+                  Content-Type: text/x-shellscript; charset="us-ascii"
+                  #!/bin/bash
+                  set -ex
+                  /etc/eks/bootstrap.sh {node_group["clusterName"]} \\
+                      --b64-cluster-ca {node_group["cluster-ca"]} \\
+                      --apiserver-endpoint {node_group["endpoint"]} \\
+                      --dns-cluster-ip {node_group["dns"]} \\
+                      --container-runtime containerd
+                  --==MYBOUNDARY==--
+                  """
+                  ).strip()
+                  encoded_user_data = base64.b64encode(user_data.encode("utf-8")).decode("utf-8")
+                  if launch_template_id not in processed_launch_templates:
+                      new_launch_template_response = ec2_client.create_launch_template_version(
+                          LaunchTemplateId=launch_template_id,
+                          SourceVersion=str(launch_template_version),
+                          LaunchTemplateData={
+                              "ImageId": image_id,
+                              "UserData": encoded_user_data,
+                          },
+                      )
+                      new_launch_template_version_number = str(
+                          new_launch_template_response["LaunchTemplateVersion"]["VersionNumber"]
+                      )
+                      node_group["version"] = new_launch_template_version_number
+                      processed_launch_templates.add(launch_template_id)
+                  else:
+                      launch_template_info = ec2_client.describe_launch_templates(
+                          LaunchTemplateIds=[launch_template_id]
+                      )
+                      latest_version_number = str(
+                          launch_template_info["LaunchTemplates"][0]["LatestVersionNumber"]
+                      )
+                      node_group["version"] = latest_version_number
+              return node_groups
+          @handle_errors
+          def lambda_handler(event, context):
+              """
+              Main Lambda function handler.
+              Args:
+                  event: A dictionary containing the event data passed to the Lambda function.
+                  context: The Lambda function execution context.
+              Returns:
+                  A list of dictionaries containing the updated auto-scaling group information.
+              """
+              eks = boto3.client("eks")
+              clusters = list_clusters(eks)
+              filtered_clusters = filter_clusters(eks, clusters, event.get("tags", []))
+              node_groups = get_node_groups(eks, filtered_clusters)
+              image_id = event["image_id"]
+              updated_node_groups = update_launch_templates(node_groups, image_id)
+              required_keys = ["launchTemplate", "clusterName", "nodegroupName", "version"]
+              response = [
+                  {key: d[key] for key in required_keys if key in d} for d in updated_node_groups
+              ]
+              return {"status": "complete", "response": response}
+      Description: Lambda function to find EKS node groups and update Launch Templates
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:60
+      ReservedConcurrentExecutions: 1
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+  # Execution role for Lambda function that update node groups
+  NGUpdateLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /lambda/
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  # IAM policy for Lambda function that update node groups
+  NGUpdateLambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: Compendating controls can be implemented to limit CreateTags and RunInstances actions. Using resource * here for simplicity.
+    Properties:
+      Description: Policy for the Node Group update Lambda function execution role
+      Path: /lambda/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - eks:UpdateNodegroupVersion
+            Resource:
+              - !Sub arn:${AWS::Partition}:eks:*:${AWS::AccountId}:nodegroup/*/*/*
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+              - ec2:RunInstances
+              - ec2:DescribeLaunchTemplateVersions
+            Resource: '*'
+          # - Effect: Allow
+          #   Action:
+          #     - ec2:CreateTags
+          #     - ec2:RunInstances
+          #   Resource:
+          #     - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*
+          #     - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:network-interface/*
+          #     - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:security-group/*
+          #     - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:subnet/*
+          #     - arn:aws:ec2:*::image/*
+          #     - !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:launch-template/*
+      Roles:
+        - !Ref NGUpdateLambdaExecutionRole
+  # Lambda function that update node groups
+  NGUpdateLambda:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: This Lambda does not require access to any resources in private subnets
+          - id: W92
+            reason: Number of concurrent executions is controlled by state machine
+    Properties:
+      Runtime: python3.11
+      Role: !GetAtt NGUpdateLambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import traceback
+          import json
+          from datetime import datetime
+          from aws_lambda_powertools import Logger
+          from aws_lambda_powertools.utilities.typing import LambdaContext
+          import boto3
+          from botocore.config import Config
+          from botocore.exceptions import BotoCoreError, ClientError
+          # Configure logging
+          logger = Logger(service="Node group updater", level="INFO")
+          # Configure Boto3 retry mode with max_attempts
+          boto3_config = Config(retries={"mode": "standard", "max_attempts": 10})
+          def handle_errors(func):
+              """
+              A decorator to handle exceptions that might be raised by the wrapped function.
+              """
+              @logger.inject_lambda_context
+              def wrapper(*args, **kwargs):
+                  try:
+                      return func(*args, **kwargs)
+                  except ClientError as e:
+                      error_code = e.response["Error"]["Code"]
+                      error_message = e.response["Error"]["Message"]
+                      logger.error(
+                          "ClientError occurred in function %s: %s - %s",
+                          traceback.extract_stack()[-2].name,
+                          error_code,
+                          error_message,
+                      )
+                      return {
+                          "status": "error",
+                          "error_code": error_code,
+                          "message": error_message,
+                      }
+                  except BotoCoreError:
+                      logger.error(
+                          "BotoCoreError occurred in function %s.",
+                          traceback.extract_stack()[-2].name,
+                      )
+                      return {"status": "error", "message": "An AWS SDK error occurred."}
+                  except Exception as e:
+                      logger.error(
+                          "Unexpected error occurred in function %s: %s",
+                          traceback.extract_stack()[-2].name,
+                          str(e),
+                      )
+                      return {
+                          "status": "error",
+                          "message": f"An unexpected error occurred: {str(e)}",
+                      }
+              return wrapper
+          def prepare_response(response):
+              """
+              Prepares the response dictionary.
+              Parameters:
+              response (dict): The response dictionary potentially containing datetime objects.
+              Returns:
+              dict: The processed dictionary with datetime objects converted to ISO 8601 format string
+              """
+              if isinstance(response['update']['createdAt'], datetime):
+                  response['update']['createdAt'] = response['update']['createdAt'].isoformat()
+              return response
+          # Create a global boto3 EKS client
+          CLIENT = boto3.client("eks")
+          def update_nodegroup(event):
+              """
+              Updates the nodegroup using the provided event details.
+              """
+              # Extract values from the input event
+              launch_template = event.get("launchTemplate", {})
+              cluster_name = event.get("clusterName")
+              nodegroup_name = event.get("nodegroupName")
+              version = event.get("version")
+              # Call the update_nodegroup_version method
+              response = CLIENT.update_nodegroup_version(
+                  clusterName=cluster_name,
+                  nodegroupName=nodegroup_name,
+                  launchTemplate={
+                      "version": version,
+                      "id": launch_template.get("id"),
+                  },
+              )
+              return response
+          @handle_errors
+          def lambda_handler(event, context):
+              """
+              Lambda function entry point.
+              """
+              response = update_nodegroup(event)
+              prepared_response = prepare_response(response)
+              return {"status": "complete", "response": prepared_response}
+      Description: Lambda function to update EKS node groups
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:60
+      Timeout: 900
+      TracingConfig:
+        Mode: Active
+  # State machine to orchestrate node group updates
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: "EKS Node Group Update"
+      DefinitionString: !Sub |
+        {
+          "Comment": "A State Machine for updating EKS cluster nodegroups",
+          "StartAt": "Gathering Node Group Information",
+          "States": {
+            "Gathering Node Group Information": {
+              "Type": "Task",
+              "Resource": "${NodeGroupInfoLambda.Arn}",
+              "ResultPath": "$",
+              "Next": "Check Gathering Node Group Information Error"
+            },
+            "Check Gathering Node Group Information Error": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "error",
+                  "Next": "ErrorHandler"
+                }
+              ],
+              "Default": "Update Node Groups"
+            },
+            "Update Node Groups": {
+              "Type": "Map",
+              "ItemsPath": "$.response",
+              "MaxConcurrency": 5,
+              "Iterator": {
+                "StartAt": "Process Node Group",
+                "States": {
+                  "Process Node Group": {
+                    "Type": "Task",
+                    "Resource": "${NGUpdateLambda.Arn}",
+                    "Next": "Check Process Node Group Error"
+                  },
+                  "Check Process Node Group Error": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.status",
+                        "StringEquals": "error",
+                        "Next": "InternalErrorHandler"
+                      }
+                    ],
+                    "Default": "Process Node Group Success"
+                  },
+                  "InternalErrorHandler": {
+                    "Type": "Fail",
+                    "Error": "MapError",
+                    "Cause": "A Lambda function within Map returned status=error."
+                  },
+                  "Process Node Group Success": {
+                    "Type": "Pass",
+                    "Result": "$",
+                    "End": true
+                  }
+                }
+              },
+              "Next": "FinalState"
+            },
+            "ErrorHandler": {
+              "Type": "Fail",
+              "Error": "ErrorRaised",
+              "Cause": "A Lambda function returned status=error."
+            },
+            "FinalState": {
+              "Type": "Pass",
+              "Result": "Everything completed successfully.",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StateMachineRole.Arn
+  # State machine's role
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Sub ${AWS::AccountId}
+      Path: /states/
+  # State machine role's policy
+  StateMachinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Policy for the State Machine updating EKS node groups
+      Path: /stepfunction/
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt NodeGroupInfoLambda.Arn
+              - !GetAtt NGUpdateLambda.Arn
+      Roles:
+        - !Ref StateMachineRole
+Outputs:
+  ImagePipelineArn:
+    Description: EC2 Image Builder Pipeline Arn
+    Value: !Ref EKSAnsiblePipeline
+  ImageUpdateReminderSNSTopicArn:
+    Description: Arn of SNS topic that sends out base image update reminders
+    Value: !Ref ImageUpdateReminderTopic
+  ImagePipelineSNSTopicARn:
+    Description: Arn of SNS topic that sends out image builder pipeline notifications
+    Value: !Ref ImagePipelineTopic
+  StateMachineArn:
+    Description: Arn of the created state machine
+    Value: !Ref StateMachine
