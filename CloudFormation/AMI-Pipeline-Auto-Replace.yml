@@ -1273,7 +1273,7 @@ Resources:
   StateMachine:
     Type: AWS::StepFunctions::StateMachine
     Properties:
-      StateMachineName: "EKS Node Group Update"
+      StateMachineName: "EKS-Node-Group-Update"
       DefinitionString: !Sub |
         {
           "Comment": "A State Machine for updating EKS cluster nodegroups",
@@ -1388,7 +1388,7 @@ Outputs:
     Value: !Ref ImageUpdateReminderTopic
   ImagePipelineSNSTopicARn:
     Description: Arn of SNS topic that sends out image builder pipeline notifications
-    Value: !Ref ImagePipelineTopic
+    Value: !Ref ImagePipelineSNSTopic
   StateMachineArn:
     Description: Arn of the created state machine
     Value: !Ref StateMachine
