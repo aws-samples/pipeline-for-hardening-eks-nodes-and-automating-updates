@@ -232,40 +232,44 @@ Resources:
                   commands:
                     - sudo yum install -y git jq
                     - sudo mkdir -p /ansible/roles/AMAZON2-CIS
-                    - git clone https://github.com/ansible-lockdown/AMAZON2-CIS.git /ansible/roles/AMAZON2-CIS
+                    - curl -fsSL https://goss.rocks/install | sh
+                    - |
+                      if [ ! -f /etc/os-release ]; then
+                        echo "The file /etc/os-release does not exist on this system."
+                        exit 1
+                      fi
+                      . /etc/os-release
+                      if [ "$ID" = "amzn" ]; then
+                        if [ "$VERSION_ID" = "2" ]; then
+                          echo "Installing Ansible on Amazon Linux 2..."
+                          sudo amazon-linux-extras install ansible2 -y
+                          export GPATH="AMAZON2-CIS-Audit"
+                          sudo mkdir -p /tmp/${!GPATH}
+                          git clone https://github.com/ansible-lockdown/AMAZON2-CIS.git /ansible/roles/AMAZON-CIS
+                          git clone https://github.com/ansible-lockdown/AMAZON2-CIS-Audit.git /tmp/${!GPATH}
+                        elif [ "$VERSION_ID" = "2023" ]; then
+                          echo "Installing Ansible on Amazon Linux 2023..."
+                          sudo yum install ansible -y
+                          export GPATH="AMAZON2023-CIS-Audit"
+                          sudo mkdir -p /tmp/${!GPATH}
+                          git clone https://github.com/ansible-lockdown/AMAZON2023-CIS.git /ansible/roles/AMAZON-CIS
+                          git clone https://github.com/ansible-lockdown/AMAZON2023-CIS-AUDIT.git /tmp/${!GPATH}
+                        else
+                          echo "Unknown Amazon Linux version: $VERSION_ID"
+                          exit 1
+                        fi
+                      else
+                        echo "This OS is not Amazon Linux."
+                        exit 1
+                      fi
                     - |
                       cat > /ansible/eks-cis.yml <<EOL
                       - name: CIS AL2 Benchmark
                         hosts: 127.0.0.1
                         connection: local
                         roles:
-                          - AMAZON2-CIS
+                          - AMAZON-CIS
                       EOL
-              - name: installAnsible
-                action: ExecuteBash
-                inputs:
-                  commands:
-                  - |
-                    if [ ! -f /etc/os-release ]; then
-                      echo "The file /etc/os-release does not exist on this system."
-                      exit 1
-                    fi
-                    . /etc/os-release
-                    if [ "$ID" = "amzn" ]; then
-                      if [ "$VERSION_ID" = "2" ]; then
-                        echo "Installing Ansible on Amazon Linux 2..."
-                        sudo amazon-linux-extras install ansible2 -y
-                      elif [ "$VERSION_ID" = "2023" ]; then
-                        echo "Installing Ansible on Amazon Linux 2023..."
-                        sudo yum install ansible -y
-                      else
-                        echo "Unknown Amazon Linux version: $VERSION_ID"
-                        exit 1
-                      fi
-                    else
-                      echo "This system is not Amazon Linux."
-                      exit 1
-                    fi
               - name: InvokeAnsible
                 action: ExecuteBash
                 inputs:
@@ -276,42 +280,32 @@ Resources:
                 inputs:
                   commands:
                     - sudo rm -rf '/ansible'
-              - name: restartCloud-init
-                action: ExecuteBash
-                inputs:
-                  commands:
-                    - sudo cloud-init clean
-          - name: test
-            steps:
-              - name: installRequirements
-                action: ExecuteBash
-                inputs:
-                  commands:
-                    - curl -fsSL https://goss.rocks/install | sh
-                    - sudo mkdir -p /var/tmp/AMAZON2-CIS-Audit
-                    - git clone https://github.com/ansible-lockdown/AMAZON2-CIS-Audit.git /var/tmp/AMAZON2-CIS-Audit
               - name: runGoss
                 action: ExecuteBash
                 inputs:
                   commands:
-                    - cd /var/tmp/AMAZON2-CIS-Audit
+                    - echo "starting to run goss"
+                    - cd /tmp/AMAZON*
                     - mkdir logs
                     - sudo su
+                    - export AUDIT_CONTENT_LOCATION="/tmp"
                     - ./run_audit.sh -o logs/$(date -d "today" +"%Y%m%d%H%M").json
+                    - mkdir /tmp/audit-results
+                    - cp -r logs/* /tmp/audit-results
               - name: UploadResultsToS3
                 action: S3Upload
                 onFailure: Abort
                 maxAttempts: 3
                 inputs:
-                  - source: /var/tmp/AMAZON2-CIS-Audit/logs/*
+                  - source: /tmp/audit-results/*
                     destination: s3://${ImagePipelineS3}/cis_audit/
                     expectedBucketOwner: ${AWS::AccountId}
               - name: DeleteGoss
                 action: ExecuteBash
                 inputs:
                   commands:
-                    - sudo yum uninstall -y git jq
-                    - sudo rm -rf /var/tmp/AMAZON2-CIS-Audit
+                    - sudo yum remove -y git jq
+                    - sudo rm -rf /tmp/AMAZON*
               - name: restartCloud-init
                 action: ExecuteBash
                 inputs:
@@ -866,6 +860,12 @@ Resources:
               - ec2:DescribeLaunchTemplates
               - eks:ListClusters
             Resource: '*'
+          - Sid: lambda2cloudformation
+            Effect: Allow
+            Action:
+              - cloudformation:DescribeStacks
+            Resource:
+              - !Ref AWS::StackId
       Roles:
         - !Ref NGLambdaExecutionRole
   # Lambda function that gathers node group information and updates launch templates
@@ -883,6 +883,7 @@ Resources:
       Code:
         ZipFile: |
           import traceback
+          import os
           import base64
           import textwrap
           from aws_lambda_powertools import Logger
@@ -977,6 +978,7 @@ Resources:
                           "cluster-ca": cluster["certificateAuthority"].get("data"),
                           "endpoint": cluster["endpoint"],
                           "dns": ".".join(raw_dns.split("/")[0].split(".")[:-1] + ["10"]),
+                          "cidr": raw_dns,
                       }
                       filtered_clusters.append(cluster_summary)
               return filtered_clusters
@@ -1012,9 +1014,36 @@ Resources:
                               "cluster-ca": cluster["cluster-ca"],
                               "endpoint": cluster["endpoint"],
                               "dns": cluster["dns"],
+                              "cidr": cluster["cidr"],
                           }
                           node_groups.append(node_group)
               return node_groups
+
+          def get_parent_image_info(region, stack_name):
+              """
+              Returns the current StackVersion from the CloudFormation stack output.
+              """
+              cloudformation = boto3.client("cloudformation", region_name=region)
+              stacks = []
+              next_token = None
+              while True:
+                  if next_token:
+                      response = cloudformation.describe_stacks(
+                          StackName=stack_name, NextToken=next_token
+                      )
+                  else:
+                      response = cloudformation.describe_stacks(StackName=stack_name)
+                  stacks.extend(response["Stacks"])
+                  next_token = response.get("NextToken")
+                  if not next_token:
+                      break
+              stack_parameters = response["Stacks"][0]["Parameters"]
+              latest_eks_optimized_ami = None
+              for parameter in stack_parameters:
+                  if parameter["ParameterKey"] == "LatestEKSOptimizedAMI":
+                      latest_eks_optimized_ami = parameter["ParameterValue"]
+              return latest_eks_optimized_ami
+
           def update_launch_templates(node_groups, image_id):
               """
               Updates the launch templates of the node groups with the provided image ID.
@@ -1026,27 +1055,47 @@ Resources:
                   A list of dictionaries containing the updated node group information.
               """
               ec2_client = boto3.client("ec2")
+              region = os.environ.get("REGION", "")
+              stack_name = os.environ.get("STACK_NAME", "")
+              ssm_parameter_name = get_parent_image_info(region, stack_name)
               processed_launch_templates = set()
               for node_group in node_groups:
                   launch_template = node_group["launchTemplate"]
                   launch_template_id = launch_template["id"]
                   launch_template_version = launch_template["version"]
-                  user_data = textwrap.dedent(
-                      f"""
-                  MIME-Version: 1.0
-                  Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
-                  --==MYBOUNDARY==
-                  Content-Type: text/x-shellscript; charset="us-ascii"
-                  #!/bin/bash
-                  set -ex
-                  /etc/eks/bootstrap.sh {node_group["clusterName"]} \\
-                      --b64-cluster-ca {node_group["cluster-ca"]} \\
-                      --apiserver-endpoint {node_group["endpoint"]} \\
-                      --dns-cluster-ip {node_group["dns"]} \\
-                      --container-runtime containerd
-                  --==MYBOUNDARY==--
-                  """
-                  ).strip()
+                  if "amazon-linux-2023" in ssm_parameter_name:
+                      user_data = textwrap.dedent(
+                          f"""
+                          ---
+                          apiVersion: node.eks.aws/v1alpha1
+                          kind: NodeConfig
+                          spec:
+                              cluster:
+                                  name: {node_group["clusterName"]}
+                                  apiServerEndpoint: {node_group["endpoint"]}
+                                  certificateAuthority: {node_group["cluster-ca"]}
+                                  cidr: {node_group["cidr"]}
+                          """
+                          ).strip()
+                  elif "amazon-linux-2" in ssm_parameter_name:
+                      user_data = textwrap.dedent(
+                          f"""
+                          MIME-Version: 1.0
+                          Content-Type: multipart/mixed; boundary="==MYBOUNDARY=="
+                          --==MYBOUNDARY==
+                          Content-Type: text/x-shellscript; charset="us-ascii"
+                          #!/bin/bash
+                          set -ex
+                          /etc/eks/bootstrap.sh {node_group["clusterName"]} \\
+                              --b64-cluster-ca {node_group["cluster-ca"]} \\
+                              --apiserver-endpoint {node_group["endpoint"]} \\
+                              --dns-cluster-ip {node_group["dns"]} \\
+                              --container-runtime containerd
+                          --==MYBOUNDARY==--
+                          """
+                          ).strip()
+                  else:
+                      logger.error("Invalid parameter value for base AMI")
                   encoded_user_data = base64.b64encode(user_data.encode("utf-8")).decode("utf-8")
                   if launch_template_id not in processed_launch_templates:
                       new_launch_template_response = ec2_client.create_launch_template_version(
@@ -1093,6 +1142,10 @@ Resources:
               ]
               return {"status": "complete", "response": response}
       Description: Lambda function to find EKS node groups and update Launch Templates
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          STACK_NAME: !Ref AWS::StackName
       Layers:
         - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV2:60
       ReservedConcurrentExecutions: 1
