@@ -4,10 +4,10 @@ Parameters:
   AnsiblePlaybookArguments:
     Type: String
     Description: Enter extra arguments you want to pass to 'ansible-playbook' command. (Advanced)
-    Default: '--skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17'
+    Default: "--extra-vars '{\"amazon2cis_firewall\":\"external\"}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17"
   LatestEKSOptimizedAMI:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
-    Default: /aws/service/eks/optimized-ami/1.27/amazon-linux-2/recommended/image_id
+    Default: /aws/service/eks/optimized-ami/1.29/amazon-linux-2/recommended/image_id
     Description: AWS Systems Manager Parameter Store parameter of the AMI ID for the worker node instances. Change this value to match the version of Kubernetes you are using.
   InstanceType:
     Description: Insance type used with EC2 Image Builder Infrastructure Configuration
@@ -243,17 +243,11 @@ Resources:
                         if [ "$VERSION_ID" = "2" ]; then
                           echo "Installing Ansible on Amazon Linux 2..."
                           sudo amazon-linux-extras install ansible2 -y
-                          export GPATH="AMAZON2-CIS-Audit"
-                          sudo mkdir -p /tmp/${!GPATH}
                           git clone https://github.com/ansible-lockdown/AMAZON2-CIS.git /ansible/roles/AMAZON-CIS
-                          git clone https://github.com/ansible-lockdown/AMAZON2-CIS-Audit.git /tmp/${!GPATH}
                         elif [ "$VERSION_ID" = "2023" ]; then
                           echo "Installing Ansible on Amazon Linux 2023..."
                           sudo yum install ansible -y
-                          export GPATH="AMAZON2023-CIS-Audit"
-                          sudo mkdir -p /tmp/${!GPATH}
                           git clone https://github.com/ansible-lockdown/AMAZON2023-CIS.git /ansible/roles/AMAZON-CIS
-                          git clone https://github.com/ansible-lockdown/AMAZON2023-CIS-AUDIT.git /tmp/${!GPATH}
                         else
                           echo "Unknown Amazon Linux version: $VERSION_ID"
                           exit 1
@@ -280,6 +274,40 @@ Resources:
                 inputs:
                   commands:
                     - sudo rm -rf '/ansible'
+              - name: restartCloud-init
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo cloud-init clean
+          - name: test
+            steps:
+              - name: DownloadGossAuditFiles
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      if [ ! -f /etc/os-release ]; then
+                        echo "The file /etc/os-release does not exist on this system."
+                        exit 1
+                      fi
+                      . /etc/os-release
+                      if [ "$ID" = "amzn" ]; then
+                        if [ "$VERSION_ID" = "2" ]; then
+                          export GPATH="AMAZON2-CIS-Audit"
+                          sudo mkdir -p /tmp/${!GPATH}
+                          git clone https://github.com/ansible-lockdown/AMAZON2-CIS-Audit.git /tmp/${!GPATH}
+                        elif [ "$VERSION_ID" = "2023" ]; then
+                          export GPATH="AMAZON2023-CIS-Audit"
+                          sudo mkdir -p /tmp/${!GPATH}
+                          git clone https://github.com/ansible-lockdown/AMAZON2023-CIS-AUDIT.git /tmp/${!GPATH}
+                        else
+                          echo "Unknown Amazon Linux version: $VERSION_ID"
+                          exit 1
+                        fi
+                      else
+                        echo "This OS is not Amazon Linux."
+                        exit 1
+                      fi
               - name: runGoss
                 action: ExecuteBash
                 inputs:
@@ -300,7 +328,7 @@ Resources:
                   - source: /tmp/audit-results/*
                     destination: s3://${ImagePipelineS3}/cis_audit/
                     expectedBucketOwner: ${AWS::AccountId}
-              - name: DeleteGoss
+              - name: DeleteResources
                 action: ExecuteBash
                 inputs:
                   commands:
