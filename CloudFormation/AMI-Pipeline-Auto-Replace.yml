@@ -230,6 +230,7 @@ Resources:
                 action: ExecuteBash
                 inputs:
                   commands:
+                    - sudo yum update -y
                     - sudo yum install -y git jq
                     - sudo mkdir -p /ansible/roles/AMAZON2-CIS
                     - curl -fsSL https://goss.rocks/install | sh
