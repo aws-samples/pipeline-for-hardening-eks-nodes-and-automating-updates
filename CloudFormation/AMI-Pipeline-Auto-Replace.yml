@@ -243,7 +243,9 @@ Resources:
                       if [ "$ID" = "amzn" ]; then
                         if [ "$VERSION_ID" = "2" ]; then
                           echo "Installing Ansible on Amazon Linux 2..."
-                          sudo amazon-linux-extras install ansible2 -y
+                          sudo python3 -m pip install wheel
+                          sudo python3 -m pip install ansible
+                          sudo python3 -m pip install jmespath
                           git clone https://github.com/ansible-lockdown/AMAZON2-CIS.git /ansible/roles/AMAZON-CIS
                         elif [ "$VERSION_ID" = "2023" ]; then
                           echo "Installing Ansible on Amazon Linux 2023..."
