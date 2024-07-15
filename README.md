@@ -47,7 +47,7 @@ This repository contains a CloudFormation template that automates the creation o
 >
 > Amazon Linux 2: `--extra-vars '{"amazon2cis_firewall":"external","amazon2cis_rule_4_5_2_4":false}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17,rule_4.5.2.4`
 >
-> Amazon Linux 2023: `--extra-vars '{"amzn2023cis_syslog_service":"external","amzn2023cis_selinux_disable":"true"}' --skip-tags rule_1.1.2.3,rule_1.1.4.3,rule_1.2.1,rule_1.3.1,rule_1.3.3,firewalld,accounts,logrotate,rule_6.2.10`
+> Amazon Linux 2023: `--extra-vars '{"amzn2023cis_syslog_service":"external","amzn2023cis_selinux_disable":true}' --skip-tags rule_1.1.2.3,rule_1.1.4.3,rule_1.2.1,rule_1.3.1,rule_1.3.3,firewalld,accounts,logrotate,rule_6.2.10`
 >
 > View [AMAZON2-CIS](https://github.com/ansible-lockdown/AMAZON2-CIS/blob/main/defaults/main.yml) and [AMAZON2023-CIS](https://github.com/ansible-lockdown/AMAZON2023-CIS/blob/main/defaults/main.yml) for a list of available variables for AL2 and AL2023 base images respectively.
 
