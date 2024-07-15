@@ -45,7 +45,7 @@ This repository contains a CloudFormation template that automates the creation o
 > [!IMPORTANT]
 > Applying all CIS benchmarks to your base image cases EC2 Image Builder pipeline to fail, and prevents your nodes from joining the cluster. At a minimum, you need to pass below values as your template's `AnsiblePlaybookArguments` parameter value.
 >
-> Amazon Linux 2: `--extra-vars '{"amazon2cis_firewall":"external"}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17`
+> Amazon Linux 2: `--extra-vars '{"amazon2cis_firewall":"external","amazon2cis_rule_4_5_2_4":false}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17,rule_4.5.2.4`
 >
 > Amazon Linux 2023: `--extra-vars '{"amzn2023cis_syslog_service":"external","amzn2023cis_selinux_disable":"true"}' --skip-tags rule_1.1.2.3,rule_1.1.4.3,rule_1.2.1,rule_1.3.1,rule_1.3.3,firewalld,accounts,logrotate,rule_6.2.10`
 >
