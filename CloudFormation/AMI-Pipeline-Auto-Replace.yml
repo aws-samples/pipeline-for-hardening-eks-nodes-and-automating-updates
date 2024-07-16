@@ -243,6 +243,9 @@ Resources:
                       if [ "$ID" = "amzn" ]; then
                         if [ "$VERSION_ID" = "2" ]; then
                           echo "Installing Ansible on Amazon Linux 2..."
+                          sudo yum remove python3
+                          sudo amazon-linux-extras install python3.8
+                          sudo ln -s /usr/bin/python3.8 /usr/bin/python3
                           sudo python3 -m pip install wheel
                           sudo python3 -m pip install ansible
                           sudo python3 -m pip install jmespath
