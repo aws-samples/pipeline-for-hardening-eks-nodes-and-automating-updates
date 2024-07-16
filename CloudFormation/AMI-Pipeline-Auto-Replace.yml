@@ -997,7 +997,7 @@ Resources:
               def has_required_tags(cluster_tags):
                   if not required_tags_set:
                       return True
-                  cluster_tags_set = {(tag["key"], tag["value"]) for tag in cluster_tags}
+                  cluster_tags_set = set(cluster_tags.items())
                   return required_tags_set.issubset(cluster_tags_set)
               filtered_clusters = []
               for cluster in clusters:

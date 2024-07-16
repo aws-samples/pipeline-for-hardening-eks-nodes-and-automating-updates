@@ -13,7 +13,6 @@ logger = Logger(service="Launch template updater", level="INFO")
 # Configure Boto3 retry mode with max_attempts
 boto3_config = Config(retries={"mode": "standard", "max_attempts": 10})
 
-
 def handle_errors(func):
     """
     A decorator to handle exceptions that might be raised by the wrapped function.
@@ -53,9 +52,7 @@ def handle_errors(func):
                 "status": "error",
                 "message": f"An unexpected error occurred: {str(e)}",
             }
-
     return wrapper
-
 
 def list_clusters(eks_client):
     """
@@ -70,7 +67,6 @@ def list_clusters(eks_client):
     for page in paginator.paginate():
         clusters.extend(page["clusters"])
     return clusters
-
 
 def filter_clusters(eks_client, clusters, required_tags):
     """
@@ -89,7 +85,7 @@ def filter_clusters(eks_client, clusters, required_tags):
     def has_required_tags(cluster_tags):
         if not required_tags_set:
             return True
-        cluster_tags_set = {(tag["key"], tag["value"]) for tag in cluster_tags}
+        cluster_tags_set = set(cluster_tags.items())
         return required_tags_set.issubset(cluster_tags_set)
 
     filtered_clusters = []
@@ -109,7 +105,6 @@ def filter_clusters(eks_client, clusters, required_tags):
             }
             filtered_clusters.append(cluster_summary)
     return filtered_clusters
-
 
 def get_node_groups(eks_client, filtered_clusters):
     """
@@ -148,7 +143,6 @@ def get_node_groups(eks_client, filtered_clusters):
                 node_groups.append(node_group)
     return node_groups
 
-
 def get_parent_image_info(region, stack_name):
     """
     Returns the current StackVersion from the CloudFormation stack output.
@@ -173,7 +167,6 @@ def get_parent_image_info(region, stack_name):
         if parameter["ParameterKey"] == "LatestEKSOptimizedAMI":
             latest_eks_optimized_ami = parameter["ParameterValue"]
     return latest_eks_optimized_ami
-
 
 def update_launch_templates(node_groups, image_id):
     """
@@ -251,7 +244,6 @@ def update_launch_templates(node_groups, image_id):
             )
             node_group["version"] = latest_version_number
     return node_groups
-
 
 @handle_errors
 def lambda_handler(event, context):
