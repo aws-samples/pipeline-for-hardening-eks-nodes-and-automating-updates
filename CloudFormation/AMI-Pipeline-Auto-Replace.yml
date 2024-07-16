@@ -4,7 +4,7 @@ Parameters:
   AnsiblePlaybookArguments:
     Type: String
     Description: Enter extra arguments you want to pass to 'ansible-playbook' command. (Advanced)
-    Default: "--extra-vars '{\"amazon2cis_firewall\":\"external\"}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17"
+    Default: "--extra-vars '{\"amazon2cis_firewall\":\"external\",\"amazon2cis_rule_4_5_2_4\":false}' --skip-tags rule_6.2.11,rule_6.2.12,rule_6.2.13,rule_6.2.14,rule_6.2.15,rule_6.2.16,rule_6.2.17,rule_4.5.2.4"
   LatestEKSOptimizedAMI:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/eks/optimized-ami/1.29/amazon-linux-2/recommended/image_id
@@ -243,8 +243,8 @@ Resources:
                       if [ "$ID" = "amzn" ]; then
                         if [ "$VERSION_ID" = "2" ]; then
                           echo "Installing Ansible on Amazon Linux 2..."
-                          sudo yum remove python3
-                          sudo amazon-linux-extras install python3.8
+                          sudo yum remove python3 -y
+                          sudo amazon-linux-extras install python3.8 -y
                           sudo ln -s /usr/bin/python3.8 /usr/bin/python3
                           sudo python3 -m pip install wheel
                           sudo python3 -m pip install ansible
