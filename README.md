@@ -39,7 +39,7 @@ This repository contains a CloudFormation template that automates the creation o
 | `DistributionConfigurationName` | EC2 Image builder distribution configuration name |
 | `ImagePipelineName` | EC2 Image builder pipeline name |
 | `EnableImageScanning` | Toggle for Amazon Inspector AMI scanning. |
-| `ClusterTags` | JSON string of key-value pairs to filter EKS clusters. |
+| `ClusterTags` | JSON string of key-value pairs to filter EKS clusters. Example: `[{"Key": "Team", "Value": "Development"}]` |
 | `CloudFormationUpdaterEventBridgeRuleState` | State of the EventBridge rule for weekend checks on new base images. |
 
 > [!IMPORTANT]
