@@ -2,7 +2,7 @@
 
 ## Description
 
-This repository contains a CloudFormation template that automates the creation of an EC2 Image Builder pipeline. The pipeline applies CIS Amazon Linux 2 or CIS Amazon Linux 2023 benchmarks (depoending on the base image) to an Amazon EKS-Optimized AMI using an Ansible playbook. The resulting hardened AMI is intended for use in updating Amazon EKS cluster node groups, enhancing security and compliance. For more details refer to [How to create a pipeline for hardening Amazon EKS nodes and automate updates](https://aws.amazon.com/blogs/security/how-to-create-a-pipeline-for-hardening-amazon-eks-nodes-and-automate-updates/) blog post on AWS Security Blog.
+This repository contains a CloudFormation template that automates the creation of an EC2 Image Builder pipeline. The pipeline applies CIS Amazon Linux 2 or CIS Amazon Linux 2023 benchmarks (depending on the base image) to an Amazon EKS-Optimized AMI using an Ansible playbook. The resulting hardened AMI is intended for use in updating Amazon EKS cluster node groups, enhancing security and compliance. For more details refer to [How to create a pipeline for hardening Amazon EKS nodes and automate updates](https://aws.amazon.com/blogs/security/how-to-create-a-pipeline-for-hardening-amazon-eks-nodes-and-automate-updates/) blog post on AWS Security Blog.
 
 ## Features
 
